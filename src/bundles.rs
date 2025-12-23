@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::Path;
 use std::result::Result::Ok;
 
 use anyhow::Result;
@@ -13,7 +14,7 @@ type Section = String;
 type Lines = Vec<String>;
 
 #[derive(Default)]
-struct BuckConfig {
+pub struct BuckConfig {
     section_order: Vec<Section>,
     sections: HashMap<Section, Lines>,
 }
@@ -98,6 +99,107 @@ impl BuckConfig {
         output.pop();
 
         output
+    }
+
+    /// In the [cells] section, return the mapping from cell names to their respective paths
+    pub fn parse_cells(&self) -> HashMap<String, String> {
+        let mut cells = HashMap::new();
+
+        if let Some(cell_lines) = self.sections.get("cells") {
+            for line in cell_lines {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+
+                // parse format: "cell_name = path" or "  cell_name = path"
+                if let Some(equal_pos) = trimmed.find('=') {
+                    let cell_name = trimmed[..equal_pos].trim().to_string();
+                    let cell_path = trimmed[equal_pos + 1..].trim().to_string();
+                    if !cell_name.is_empty() && !cell_path.is_empty() {
+                        cells.insert(cell_name, cell_path);
+                    }
+                }
+            }
+        }
+
+        cells
+    }
+
+    /// Parse the [cell_aliases] section and return the mapping from aliases to cell names.
+    pub fn parse_cell_aliases(&self) -> HashMap<String, String> {
+        let mut aliases = HashMap::new();
+
+        if let Some(alias_lines) = self.sections.get("cell_aliases") {
+            for line in alias_lines {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+
+                // parse format: "alias = cell_name" or "  alias = cell_name"
+                if let Some(equal_pos) = trimmed.find('=') {
+                    let alias = trimmed[..equal_pos].trim().to_string();
+                    let cell_name = trimmed[equal_pos + 1..].trim().to_string();
+                    if !alias.is_empty() && !cell_name.is_empty() {
+                        aliases.insert(alias, cell_name);
+                    }
+                }
+            }
+        }
+
+        aliases
+    }
+
+    /// Determine the corresponding cell based on the file path
+    pub fn find_cell_for_path(&self, path: &Path, buck2_root: &Path) -> Option<String> {
+        let cells = self.parse_cells();
+        let aliases = self.parse_cell_aliases();
+
+        // First, parse the complete cell mapping (considering aliases)
+        let mut cell_mappings = HashMap::new();
+        for (cell_name, cell_path) in &cells {
+            cell_mappings.insert(cell_name.clone(), cell_path.clone());
+        }
+
+        // Apply the alias mapping
+        for (alias, cell_name) in &aliases {
+            if let Some(cell_path) = cells.get(cell_name) {
+                cell_mappings.insert(alias.clone(), cell_path.clone());
+            }
+        }
+
+        // Convert the path to a relative path relative to buck2_root
+        let relative_path = match path.strip_prefix(buck2_root) {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
+
+        // Search for the matching cell (using the most specific match)
+        let mut best_match: Option<(String, usize)> = None;
+
+        for (cell_name, cell_path) in &cell_mappings {
+            // Convert the cell path to a Path
+            let cell_path_obj = Path::new(cell_path);
+
+            // Check if the path starts with the cell path
+            if relative_path.starts_with(cell_path_obj) {
+                let match_length = cell_path_obj.components().count();
+
+                // Select the most specific match (the one with the longest path)
+                match &best_match {
+                    Some((_, current_length)) if match_length > *current_length => {
+                        best_match = Some((cell_name.clone(), match_length));
+                    }
+                    None => {
+                        best_match = Some((cell_name.clone(), match_length));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        best_match.map(|(cell_name, _)| cell_name)
     }
 }
 

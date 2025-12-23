@@ -21,11 +21,11 @@ use crate::{
         RustBinary, RustLibrary, RustRule, RustTest, parse_buck_file, patch_buck_rules,
     },
     buck2::Buck2Command,
-    buckal_log,
+    buckal_log, buckal_warn,
     cache::{BuckalChange, ChangeType},
     context::BuckalContext,
     platform::lookup_platforms,
-    utils::{UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_dir},
+    utils::{UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_dir, rewrite_target_if_needed},
 };
 
 pub fn buckify_dep_node(node: &Node, ctx: &BuckalContext) -> Vec<Rule> {
@@ -92,7 +92,7 @@ pub fn buckify_dep_node(node: &Node, ctx: &BuckalContext) -> Vec<Rule> {
         buck_rules.push(Rule::RustBinary(buildscript_build));
 
         // create the build script run rule
-        let buildscript_run = emit_buildscript_run(&package, node, &ctx.packages_map, build_target);
+        let buildscript_run = emit_buildscript_run(&package, node, &ctx.packages_map, build_target, ctx);
         buck_rules.push(Rule::BuildscriptRun(buildscript_run));
     }
 
@@ -262,7 +262,7 @@ pub fn buckify_root_node(node: &Node, ctx: &BuckalContext) -> Vec<Rule> {
         buck_rules.push(Rule::RustBinary(buildscript_build));
 
         // create the build script run rule
-        let buildscript_run = emit_buildscript_run(&package, node, &ctx.packages_map, build_target);
+        let buildscript_run = emit_buildscript_run(&package, node, &ctx.packages_map, build_target, ctx);
         buck_rules.push(Rule::BuildscriptRun(buildscript_run));
     }
 
@@ -332,6 +332,7 @@ fn set_deps(
     packages_map: &HashMap<PackageId, Package>,
     kind: CargoTargetKind,
     ctx: &BuckalContext,
+    package: &Package,
 ) {
     for dep in &node.deps {
         if let Some(dep_package) = packages_map.get(&dep.pkg) {
@@ -386,16 +387,39 @@ fn set_deps(
                                 .and_then(|n| n.as_str())
                                 .expect("Failed to get target name");
 
+                            let target_label = format!("{buck_package}:{buck_name}");
+
+                            // Obtain the current BUCK file path
+                            // For root directory, the BUCK file is located in the project root directory
+                            // For third-party packages, the BUCK file is located in the vendor directory
+                            let current_buck_path = if package.source.is_none() {
+                                // The BUCK file is located in the project's root directory
+                                get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root").join("BUCK")
+                            } else {
+                                // The BUCK file is located in the vendor directory
+                                get_vendor_dir(&package.name, &package.version.to_string())
+                                    .unwrap_or_exit_ctx("failed to get vendor directory")
+                                    .join("BUCK")
+                            };
+
+                            let rewritten_target = rewrite_target_if_needed(
+                                &target_label,
+                                buck2_root.as_std_path(),
+                                ctx.repo_config.align_cells,
+                                current_buck_path.as_std_path(),
+                            ).unwrap_or_else(|e| {
+                                buckal_warn!("Failed to rewrite target label '{}': {}", target_label, e);
+                                target_label
+                            });
+
                             if dep.name != dep_package_name.replace("-", "_") {
                                 // renamed dependency
                                 rust_rule.named_deps_mut().insert(
                                     dep.name.clone(),
-                                    format!("{buck_package}:{buck_name}"),
+                                    rewritten_target,
                                 );
                             } else {
-                                rust_rule
-                                    .deps_mut()
-                                    .insert(format!("{buck_package}:{buck_name}"));
+                                rust_rule.deps_mut().insert(rewritten_target);
                             }
                         }
                         Ok(output) => {
@@ -422,12 +446,35 @@ fn set_deps(
                         )
                     };
 
+                    // Obtain the current BUCK file path
+                    // For root directory, the BUCK file is located in the project root directory
+                    // For third-party packages, the BUCK file is located in the vendor directory
+                    let current_buck_path = if package.source.is_none() {
+                        // the BUCK file is located in the project root directory
+                        get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root").join("BUCK")
+                    } else {
+                        // the BUCK file is located in the vendor directory
+                        get_vendor_dir(&package.name, &package.version.to_string())
+                            .unwrap_or_exit_ctx("failed to get vendor directory")
+                            .join("BUCK")
+                    };
+
+                    let rewritten_target = rewrite_target_if_needed(
+                        &dep_target,
+                        get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root").as_std_path(),
+                        ctx.repo_config.align_cells,
+                        current_buck_path.as_std_path(),
+                    ).unwrap_or_else(|e| {
+                        buckal_warn!("Failed to rewrite target label '{}': {}", dep_target, e);
+                        dep_target.clone()
+                    });
+
                     if dep.name != dep_package_name.replace("-", "_") {
                         rust_rule
                             .named_deps_mut()
-                            .insert(dep.name.clone(), dep_target);
+                            .insert(dep.name.clone(), rewritten_target);
                     } else {
-                        rust_rule.deps_mut().insert(dep_target);
+                        rust_rule.deps_mut().insert(rewritten_target);
                     }
                 }
             }
@@ -488,6 +535,7 @@ fn emit_rust_library(
         packages_map,
         CargoTargetKind::Lib,
         ctx,
+        package,
     );
     rust_library
 }
@@ -533,6 +581,7 @@ fn emit_rust_binary(
         packages_map,
         CargoTargetKind::Bin,
         ctx,
+        package,
     );
     rust_binary
 }
@@ -578,6 +627,7 @@ fn emit_rust_test(
         packages_map,
         CargoTargetKind::Test,
         ctx,
+        package,
     );
     rust_test
 }
@@ -622,6 +672,7 @@ fn emit_buildscript_build(
         packages_map,
         CargoTargetKind::CustomBuild,
         ctx,
+        package,
     );
 
     buildscript_build
@@ -633,6 +684,7 @@ fn emit_buildscript_run(
     node: &Node,
     packages_map: &HashMap<PackageId, Package>,
     build_target: &Target,
+    ctx: &BuckalContext,
 ) -> BuildscriptRun {
     // create the build script run rule
     let build_name = get_build_name(&build_target.name);
@@ -665,10 +717,33 @@ fn emit_buildscript_run(
                 .find(|t| t.kind.contains(&cargo_metadata::TargetKind::CustomBuild));
             if let Some(build_target_dep) = custom_build_target_dep {
                 let build_name_dep = get_build_name(&build_target_dep.name);
-                buildscript_run.env_srcs.insert(format!(
+                let target_label = format!(
                     "//{RUST_CRATES_ROOT}/{}/{}:{}-{build_name_dep}-run[metadata]",
                     dep_package.name, dep_package.version, dep_package.name
-                ));
+                );
+                // Obtain the current BUCK file path
+                // For root directory, the BUCK file is located in the project root directory
+                // For third-party packages, the BUCK file is located in the vendor directory
+                let current_buck_path = if package.source.is_none() {
+                    // the BUCK file is located in the project root directory
+                    get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root").join("BUCK")
+                } else {
+                    // the BUCK file is located in the vendor directory
+                    get_vendor_dir(&package.name, &package.version.to_string())
+                        .unwrap_or_exit_ctx("failed to get vendor directory")
+                        .join("BUCK")
+                };
+
+                let rewritten_target = rewrite_target_if_needed(
+                    &target_label,
+                    get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root").as_std_path(),
+                    ctx.repo_config.align_cells,
+                    current_buck_path.as_std_path(),
+                ).unwrap_or_else(|e| {
+                    buckal_warn!("Failed to rewrite target label '{}': {}", target_label, e);
+                    target_label.clone()
+                });
+                buildscript_run.env_srcs.insert(rewritten_target);
             } else {
                 panic!(
                     "Dependency {} has links key but no build script target",
@@ -929,10 +1004,19 @@ pub fn generate_third_party_aliases(ctx: &BuckalContext) {
             "//third-party/rust/crates/{}/{}:{}",
             crate_name, latest.version, crate_name
         );
+        let rewritten_actual = rewrite_target_if_needed(
+            &actual,
+            root.as_std_path(),
+            ctx.repo_config.align_cells,
+            buck_file.as_std_path(), // third-party/rust/BUCK file path
+        ).unwrap_or_else(|e| {
+            buckal_warn!("Failed to rewrite target label '{}': {}", actual, e);
+            actual.clone()
+        });
 
         let rule = Alias {
             name: crate_name.clone(),
-            actual,
+            actual: rewritten_actual,
             visibility: ["PUBLIC"].into_iter().map(String::from).collect(),
         };
         let rendered = serde_starlark::to_string(&rule).expect("failed to serialize alias");
