@@ -557,8 +557,7 @@ fn compute_cell_aliases(cell_mapping: &HashMap<String, String>) -> HashMap<Strin
 
     for (key, absolute_path) in cell_mapping {
         // Convert absolute path to relative path starting with "//"
-        let relative_path = if absolute_path.starts_with(project_root) {
-            let relative = &absolute_path[project_root.len()..];
+        let relative_path = if let Some(relative) = absolute_path.strip_prefix(project_root) {
             // Remove leading path separators
             let relative = relative.trim_start_matches(&['\\', '/'][..]);
             if relative.is_empty() {
@@ -576,7 +575,7 @@ fn compute_cell_aliases(cell_mapping: &HashMap<String, String>) -> HashMap<Strin
         // Group keys by their relative path
         path_to_keys
             .entry(relative_path)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(key.clone());
     }
 
