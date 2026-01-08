@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::{io, process::Command, str::FromStr};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::{io, process::Command, str::FromStr};
 
 use anyhow::{Context, Result};
 use cargo_metadata::MetadataCommand;
@@ -11,7 +12,6 @@ use inquire::Select;
 
 use crate::RUST_CRATES_ROOT;
 use crate::buck2::Buck2Command;
-use crate::bundles::BuckConfig;
 use crate::cache::BuckalCache;
 
 #[macro_export]
@@ -456,223 +456,203 @@ impl<T, E: std::fmt::Display> UnwrapOrExit<T> for Result<T, E> {
     }
 }
 
-/// Load the cell alias mapping (cell name/alias -> normalized cell name)
-pub fn load_cell_aliases(buck2_root: &Path) -> Result<HashMap<String, String>> {
-    let buckconfig_path = buck2_root.join(".buckconfig");
+// Cache for cell mapping results
+static CELL_MAPPING_CACHE: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> =
+    OnceLock::new();
 
-    if !buckconfig_path.exists() {
-        // If there is no .buckconfig file, return an empty mapping
-        return Ok(HashMap::new());
-    }
+/// Get cell mapping using buck2 audit cell command with caching
+/// Returns a HashMap where key is cell name or alias, value is absolute path
+pub fn get_cell_mapping_via_buck2(buck2_root: &Path) -> Result<HashMap<String, String>> {
+    // Get cache or initialize it
+    let cache = CELL_MAPPING_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
-    let buckconfig = BuckConfig::load(&buckconfig_path)
-        .context("Failed to load .buckconfig file")?;
+    // Convert buck2_root to string key
+    let buck2_root_str = buck2_root.to_string_lossy().to_string();
 
-    let cells = buckconfig.parse_cells();
-    let aliases = buckconfig.parse_cell_aliases();
-
-    // Create the alias mapping: cell name/alias -> normalized cell name
-    let mut cell_aliases = HashMap::new();
-
-    // First, add all cell names to its own mapping    
-    for cell_name in cells.keys() {
-        cell_aliases.insert(cell_name.clone(), cell_name.clone());
-    }
-
-    // Then add the alias mapping
-    for (alias, cell_name) in &aliases {
-        if cells.contains_key(cell_name) {
-            cell_aliases.insert(alias.clone(), cell_name.clone());
-        } else {
-            // If the alias points to an non-existent cell, record a warning but continue
-            buckal_warn!(
-                "Cell alias '{}' points to undefined cell '{}' in .buckconfig",
-                alias, cell_name
-            );
+    // Check cache first
+    {
+        let cache_lock = cache.lock().unwrap();
+        if let Some(cached_result) = cache_lock.get(&buck2_root_str) {
+            return Ok(cached_result.clone());
         }
     }
 
-    Ok(cell_aliases)
+    // Not in cache, execute command
+    let result = get_cell_mapping_via_buck2_uncached(buck2_root)?;
+
+    // Store in cache
+    let mut cache_lock = cache.lock().unwrap();
+    cache_lock.insert(buck2_root_str, result.clone());
+
+    Ok(result)
 }
 
-/// Rewrite the target label based on the cell mapping 
-///
-/// # Paras
-/// - `target`: The target label to be rewritten
-/// - `cell_aliases`: Mapping of cell aliases
-/// - `buck2_root`: Root directory of the Buck2 project
-/// - `buckconfig`: BuckConfig object
-/// - `current_file_path`: The path of the current BUCK file being generated 
-///                        (used to determine whether to add the @ prefix)
-pub fn rewrite_target_with_cell(
-    target: &str,
-    cell_aliases: &HashMap<String, String>,
-    buck2_root: &Path,
-    buckconfig: &BuckConfig,
-    current_file_path: &Path,
-) -> String {
-    // Parse the target format
-    // Supported formats:
-    // 1. //path/to/target:name
-    // 2. cell//path/to/target:name
-    // 3. //:name (root target)
+/// Internal function that actually executes the buck2 command (uncached)
+fn get_cell_mapping_via_buck2_uncached(buck2_root: &Path) -> Result<HashMap<String, String>> {
+    // Change to buck2 root directory to run the command
+    let current_dir = std::env::current_dir()?;
+    std::env::set_current_dir(buck2_root)?;
 
+    let result = Buck2Command::new()
+        .arg("audit")
+        .arg("cell")
+        .arg("--json")
+        .arg("--aliases")
+        .output();
+
+    // Restore original directory
+    std::env::set_current_dir(&current_dir)?;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            let cell_mapping: HashMap<String, String> = serde_json::from_str(&json_str)
+                .context("Failed to parse buck2 audit cell --json output")?;
+            Ok(cell_mapping)
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            buckal_warn!(
+                "buck2 audit cell command failed with status: {}\nstderr: {}\nstdout: {}",
+                output.status,
+                stderr,
+                stdout
+            );
+            Err(anyhow::anyhow!(
+                "buck2 audit cell command failed with status: {}\nstderr: {}",
+                output.status,
+                stderr
+            ))
+        }
+        Err(e) => {
+            buckal_warn!("Failed to execute buck2 audit cell command: {}", e);
+            Err(anyhow::anyhow!(
+                "Failed to execute buck2 audit cell command: {}",
+                e
+            ))
+        }
+    }
+}
+
+/// Compute cell aliases from cell mapping
+/// Converts absolute paths to relative paths starting with "//"
+/// For example: "L:\\...\\hello_world\\third-party" -> "//third-party"
+/// If there are multiple keys corresponding to the same path,
+/// select the shortest one as the final key and remove the others.
+fn compute_cell_aliases(cell_mapping: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+
+    // First, find the project root directory
+    // We assume the "root" key contains the project root path
+    let project_root = cell_mapping.get("root").map(|s| s.as_str()).unwrap_or("");
+
+    if project_root.is_empty() {
+        // If no root found, return empty mapping
+        return result;
+    }
+
+    // Group paths by their normalized value (relative path)
+    let mut path_to_keys: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (key, absolute_path) in cell_mapping {
+        // Convert absolute path to relative path starting with "//"
+        let relative_path = if absolute_path.starts_with(project_root) {
+            let relative = &absolute_path[project_root.len()..];
+            // Remove leading path separators
+            let relative = relative.trim_start_matches(&['\\', '/'][..]);
+            if relative.is_empty() {
+                "//".to_string()
+            } else {
+                // Replace backslashes with forward slashes
+                let normalized = relative.replace('\\', "/");
+                format!("//{}", normalized)
+            }
+        } else {
+            // If path doesn't start with project root, keep as-is
+            absolute_path.clone()
+        };
+
+        // Group keys by their relative path
+        path_to_keys
+            .entry(relative_path)
+            .or_insert_with(Vec::new)
+            .push(key.clone());
+    }
+
+    // For each relative path, find the shortest key
+    for (relative_path, keys) in path_to_keys {
+        // Find the shortest key for this relative path
+        let shortest_key = keys
+            .iter()
+            .min_by_key(|k| k.len())
+            .cloned()
+            .unwrap_or_default();
+
+        if shortest_key.is_empty() {
+            continue;
+        }
+
+        // Only keep the shortest key mapping to the relative path
+        result.insert(shortest_key, relative_path);
+        // Other keys are not included in the result (deleted)
+    }
+
+    result
+}
+
+/// Simplified version: Rewrite target label using cell mapping
+/// This version replaces target paths with cell aliases
+pub fn rewrite_target_simple(
+    target: &str,
+    cell_mapping: &HashMap<String, String>,
+    current_file_path: &Path,
+    buck2_root: &Path,
+) -> String {
     if target.is_empty() {
         return target.to_string();
     }
 
-    // Determine whether the current file is located in the root directory
-    // BUCK files in the root directory do not have the '@' prefix, while BUCK files 
-    // in other directories do have the '@' prefix
-    let is_in_root = if let Ok(relative_path) = current_file_path.strip_prefix(buck2_root) {        
-        // If the parent directory of the relative path is empty (that is, 
-        // the file is directly in the root directory), then it is in the root directory.
-        relative_path.parent().map(|p| p.as_os_str().is_empty()).unwrap_or(false)
+    // Compute cell aliases from cell mapping
+    let cell_aliases = compute_cell_aliases(cell_mapping);
+
+    // Check if we're in root directory (no @ prefix needed for root BUCK files)
+    let is_in_root = current_file_path
+        .parent()
+        .map(|p| p == buck2_root)
+        .unwrap_or(false);
+
+    // Find the longest matching value in cell_aliases
+    let mut best_match: Option<(&String, &String)> = None;
+
+    for (key, value) in &cell_aliases {
+        if target.starts_with(value) {
+            match best_match {
+                None => best_match = Some((key, value)),
+                Some((_, current_value)) => {
+                    if value.len() > current_value.len() {
+                        best_match = Some((key, value));
+                    }
+                }
+            }
+        }
+    }
+
+    let result = if let Some((key, value)) = best_match {
+        // Replace the value with key
+        let remaining_path = &target[value.len()..];
+        format!("{}/{}", key, remaining_path)
     } else {
-        false
+        // No match found, return original target without @ prefix
+        target.to_string()
     };
-    
-    // Check if there is already a "cell" prefix
-    if let Some(sep_pos) = target.find("//") {
-        let before_sep = &target[..sep_pos];
-        let after_sep = &target[sep_pos + 2..]; // skip "//"
 
-        if before_sep.is_empty() {
-            // format: //path/to/target:name
-            // The corresponding cell needs to be found based on the path.
-
-            // Extract the path part (before the :)
-            if let Some(colon_pos) = after_sep.find(':') {
-                let path_part = &after_sep[..colon_pos];
-                let _name_part = &after_sep[colon_pos..]; // include :
-
-                // Build a complete path
-                let full_path = if path_part.is_empty() {
-                    // root path
-                    buck2_root.to_path_buf()
-                } else {
-                    buck2_root.join(path_part)
-                };
-
-                // Search for the corresponding cell
-                if let Some(cell_name) = buckconfig.find_cell_for_path(&full_path, buck2_root) {
-                    // Obtain the path of the cell
-                    let cells = buckconfig.parse_cells();
-                    if let Some(cell_path) = cells.get(&cell_name) {
-                        // Remove the "cell" path prefix from the path section
-                        let new_path_part = if !cell_path.is_empty() && path_part.starts_with(cell_path) {
-                            // Remove the cell path prefix and any possible /
-                            let remaining = &path_part[cell_path.len()..];
-                            if remaining.starts_with('/') {
-                                &remaining[1..]
-                            } else {
-                                remaining
-                            }
-                        } else {
-                            path_part
-                        };
-
-                        // Build the new "after_sep"
-                        let new_after_sep = if new_path_part.is_empty() {
-                            format!(":{}", &after_sep[colon_pos + 1..])
-                        } else {
-                            format!("{}:{}", new_path_part, &after_sep[colon_pos + 1..])
-                        };
-
-                        // rewrite cell//path/to/target:name
-                        let result = format!("{}{}{}", cell_name, "//", new_after_sep);                        
-                        // if not at root path, add '@' prefix
-                        return if !is_in_root && !result.starts_with('@') {
-                            format!("@{}", result)
-                        } else {
-                            result
-                        };
-                    } else {
-                        // rewrite cell//path/to/target:name
-                        let result = format!("{}{}{}", cell_name, "//", after_sep);
-                        // if not at root path, add '@' prefix
-                        return if !is_in_root && !result.starts_with('@') {
-                            format!("@{}", result)
-                        } else {
-                            result
-                        };
-                    }
-                }                
-                // If no matching cell is found, leave it as it is.
-            }
-        } else {
-            // format: cell//path/to/target:name            
-            // Check whether the cell requires normalization (eg: through aliases)
-            let cell_name = before_sep;
-
-            // Obtain the standardized cell name
-            let canonical_cell_name = cell_aliases.get(cell_name).map(|s| s.as_str()).unwrap_or(cell_name);
-
-            // obtain cell path
-            let cells = buckconfig.parse_cells();
-            if let Some(cell_path) = cells.get(canonical_cell_name) {                
-                // Extract the path part (before the :)
-                if let Some(colon_pos) = after_sep.find(':') {
-                    let path_part = &after_sep[..colon_pos];
-
-                    // Remove the "cell" path prefix from the path section
-                    let new_path_part = if !cell_path.is_empty() && path_part.starts_with(cell_path) {
-                        // Remove the cell path prefix and any possible leading slashes
-                        let remaining = &path_part[cell_path.len()..];
-                        if remaining.starts_with('/') {
-                            &remaining[1..]
-                        } else {
-                            remaining
-                        }
-                    } else {
-                        path_part
-                    };
-
-                    // Build the new "after_sep"
-                    let new_after_sep = if new_path_part.is_empty() {
-                        format!(":{}", &after_sep[colon_pos + 1..])
-                    } else {
-                        format!("{}:{}", new_path_part, &after_sep[colon_pos + 1..])
-                    };
-
-                    // If the cell name changes or the path is modified, return the new target.
-                    if canonical_cell_name != cell_name || new_path_part != path_part {
-                        let result = format!("{}{}{}", canonical_cell_name, "//", new_after_sep);
-                        // If not in the root directory, add the '@' prefix
-                        return if !is_in_root && !result.starts_with('@') {
-                            format!("@{}", result)
-                        } else {
-                            result
-                        };
-                    }
-                }
-            } else if let Some(canonical_cell_name) = cell_aliases.get(cell_name) {                
-                // If there is an alias mapping for the cell, but the cell path cannot be found, 
-                // only the cell name will be normalized.
-                if canonical_cell_name != cell_name {
-                    let result = format!("{}{}{}", canonical_cell_name, "//", after_sep);
-                    // if not at root path, add @ prefix
-                    return if !is_in_root && !result.starts_with('@') {
-                        format!("@{}", result)
-                    } else {
-                        result
-                    };
-                }
-            }
-        }
+    // Add @ prefix if not in root or if original had @ prefix
+    if !is_in_root && !result.starts_with('@') {
+        format!("@{}", result)
+    } else {
+        result
     }
-
-    // If there is no match or the format cannot be parsed, return the original target.
-    let result = target.to_string();    
-    // If the file is not in the root directory and the target has the "cell" prefix 
-    // but does not have the "@" prefix, add the "@" prefix.
-    if !is_in_root && !result.starts_with('@') && result.contains("//") {        
-        // Check if there is a "cell" prefix (not starting with "//")
-        if !result.starts_with("//") {
-            return format!("@{}", result);
-        }
-    }
-    result
 }
 
 /// Reconfigure the target label (if align_cells is enabled)
@@ -686,16 +666,13 @@ pub fn rewrite_target_if_needed(
         return Ok(target.to_string());
     }
 
-    let buckconfig_path = buck2_root.join(".buckconfig");
-    if !buckconfig_path.exists() {
-        // If there is no .buckconfig file, return the original target.
-        return Ok(target.to_string());
-    }
+    let cell_mapping = get_cell_mapping_via_buck2(buck2_root)?;
 
-    let buckconfig = BuckConfig::load(&buckconfig_path)
-        .context("Failed to load .buckconfig file")?;
-
-    let cell_aliases = load_cell_aliases(buck2_root)?;
-
-    Ok(rewrite_target_with_cell(target, &cell_aliases, buck2_root, &buckconfig, current_file_path))
+    // Use simplified version that handles cell alias normalization and path-based cell detection
+    Ok(rewrite_target_simple(
+        target,
+        &cell_mapping,
+        current_file_path,
+        buck2_root,
+    ))
 }

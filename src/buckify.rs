@@ -25,7 +25,10 @@ use crate::{
     cache::{BuckalChange, ChangeType},
     context::BuckalContext,
     platform::lookup_platforms,
-    utils::{UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_dir, rewrite_target_if_needed},
+    utils::{
+        UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_dir,
+        rewrite_target_if_needed,
+    },
 };
 
 pub fn buckify_dep_node(node: &Node, ctx: &BuckalContext) -> Vec<Rule> {
@@ -92,7 +95,8 @@ pub fn buckify_dep_node(node: &Node, ctx: &BuckalContext) -> Vec<Rule> {
         buck_rules.push(Rule::RustBinary(buildscript_build));
 
         // create the build script run rule
-        let buildscript_run = emit_buildscript_run(&package, node, &ctx.packages_map, build_target, ctx);
+        let buildscript_run =
+            emit_buildscript_run(&package, node, &ctx.packages_map, build_target, ctx);
         buck_rules.push(Rule::BuildscriptRun(buildscript_run));
     }
 
@@ -262,7 +266,8 @@ pub fn buckify_root_node(node: &Node, ctx: &BuckalContext) -> Vec<Rule> {
         buck_rules.push(Rule::RustBinary(buildscript_build));
 
         // create the build script run rule
-        let buildscript_run = emit_buildscript_run(&package, node, &ctx.packages_map, build_target, ctx);
+        let buildscript_run =
+            emit_buildscript_run(&package, node, &ctx.packages_map, build_target, ctx);
         buck_rules.push(Rule::BuildscriptRun(buildscript_run));
     }
 
@@ -394,7 +399,9 @@ fn set_deps(
                             // For third-party packages, the BUCK file is located in the vendor directory
                             let current_buck_path = if package.source.is_none() {
                                 // The BUCK file is located in the project's root directory
-                                get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root").join("BUCK")
+                                get_buck2_root()
+                                    .unwrap_or_exit_ctx("failed to get buck2 root")
+                                    .join("BUCK")
                             } else {
                                 // The BUCK file is located in the vendor directory
                                 get_vendor_dir(&package.name, &package.version.to_string())
@@ -407,17 +414,21 @@ fn set_deps(
                                 buck2_root.as_std_path(),
                                 ctx.repo_config.align_cells,
                                 current_buck_path.as_std_path(),
-                            ).unwrap_or_else(|e| {
-                                buckal_warn!("Failed to rewrite target label '{}': {}", target_label, e);
+                            )
+                            .unwrap_or_else(|e| {
+                                buckal_warn!(
+                                    "Failed to rewrite target label '{}': {}",
+                                    target_label,
+                                    e
+                                );
                                 target_label
                             });
 
                             if dep.name != dep_package_name.replace("-", "_") {
                                 // renamed dependency
-                                rust_rule.named_deps_mut().insert(
-                                    dep.name.clone(),
-                                    rewritten_target,
-                                );
+                                rust_rule
+                                    .named_deps_mut()
+                                    .insert(dep.name.clone(), rewritten_target);
                             } else {
                                 rust_rule.deps_mut().insert(rewritten_target);
                             }
@@ -451,7 +462,9 @@ fn set_deps(
                     // For third-party packages, the BUCK file is located in the vendor directory
                     let current_buck_path = if package.source.is_none() {
                         // the BUCK file is located in the project root directory
-                        get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root").join("BUCK")
+                        get_buck2_root()
+                            .unwrap_or_exit_ctx("failed to get buck2 root")
+                            .join("BUCK")
                     } else {
                         // the BUCK file is located in the vendor directory
                         get_vendor_dir(&package.name, &package.version.to_string())
@@ -461,10 +474,13 @@ fn set_deps(
 
                     let rewritten_target = rewrite_target_if_needed(
                         &dep_target,
-                        get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root").as_std_path(),
+                        get_buck2_root()
+                            .unwrap_or_exit_ctx("failed to get buck2 root")
+                            .as_std_path(),
                         ctx.repo_config.align_cells,
                         current_buck_path.as_std_path(),
-                    ).unwrap_or_else(|e| {
+                    )
+                    .unwrap_or_else(|e| {
                         buckal_warn!("Failed to rewrite target label '{}': {}", dep_target, e);
                         dep_target.clone()
                     });
@@ -726,7 +742,9 @@ fn emit_buildscript_run(
                 // For third-party packages, the BUCK file is located in the vendor directory
                 let current_buck_path = if package.source.is_none() {
                     // the BUCK file is located in the project root directory
-                    get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root").join("BUCK")
+                    get_buck2_root()
+                        .unwrap_or_exit_ctx("failed to get buck2 root")
+                        .join("BUCK")
                 } else {
                     // the BUCK file is located in the vendor directory
                     get_vendor_dir(&package.name, &package.version.to_string())
@@ -736,10 +754,13 @@ fn emit_buildscript_run(
 
                 let rewritten_target = rewrite_target_if_needed(
                     &target_label,
-                    get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root").as_std_path(),
+                    get_buck2_root()
+                        .unwrap_or_exit_ctx("failed to get buck2 root")
+                        .as_std_path(),
                     ctx.repo_config.align_cells,
                     current_buck_path.as_std_path(),
-                ).unwrap_or_else(|e| {
+                )
+                .unwrap_or_else(|e| {
                     buckal_warn!("Failed to rewrite target label '{}': {}", target_label, e);
                     target_label.clone()
                 });
@@ -1009,7 +1030,8 @@ pub fn generate_third_party_aliases(ctx: &BuckalContext) {
             root.as_std_path(),
             ctx.repo_config.align_cells,
             buck_file.as_std_path(), // third-party/rust/BUCK file path
-        ).unwrap_or_else(|e| {
+        )
+        .unwrap_or_else(|e| {
             buckal_warn!("Failed to rewrite target label '{}': {}", actual, e);
             actual.clone()
         });
