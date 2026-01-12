@@ -640,7 +640,11 @@ pub fn rewrite_target_simple(
     let result = if let Some((key, value)) = best_match {
         // Replace the value with key
         let remaining_path = &target[value.len()..];
-        format!("{}/{}", key, remaining_path)
+        if remaining_path.starts_with(':') {
+            format!("{}//{}", key, remaining_path)
+        } else {
+            format!("{}/{}", key, remaining_path)
+        }
     } else {
         // No match found, return original target without @ prefix
         target.to_string()
