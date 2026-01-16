@@ -6,13 +6,12 @@ use std::{
     vec,
 };
 
-use crate::buck::Alias;
+use crate::{buck::Alias, buckal_error};
 use cargo_metadata::{
     DepKindInfo, DependencyKind, Node, Package, PackageId, Target, camino::Utf8PathBuf,
 };
 use itertools::Itertools;
 use regex::Regex;
-use serde_json::Value;
 
 use crate::{
     RUST_CRATES_ROOT,
@@ -20,7 +19,6 @@ use crate::{
         BuildscriptRun, CargoManifest, CargoTargetKind, FileGroup, Glob, HttpArchive, Load, Rule,
         RustBinary, RustLibrary, RustRule, RustTest, parse_buck_file, patch_buck_rules,
     },
-    buck2::Buck2Command,
     buckal_log, buckal_warn,
     cache::{BuckalChange, ChangeType},
     context::BuckalContext,
@@ -112,18 +110,7 @@ pub fn buckify_root_node(node: &Node, ctx: &BuckalContext) -> Vec<Rule> {
         .filter(|t| t.kind.contains(&cargo_metadata::TargetKind::Bin))
         .collect::<Vec<_>>();
 
-    let lib_targets = package
-        .targets
-        .iter()
-        .filter(|t| {
-            t.kind.contains(&cargo_metadata::TargetKind::Lib)
-                || t.kind.contains(&cargo_metadata::TargetKind::CDyLib)
-                || t.kind.contains(&cargo_metadata::TargetKind::DyLib)
-                || t.kind.contains(&cargo_metadata::TargetKind::RLib)
-                || t.kind.contains(&cargo_metadata::TargetKind::StaticLib)
-                || t.kind.contains(&cargo_metadata::TargetKind::ProcMacro)
-        })
-        .collect::<Vec<_>>();
+    let lib_targets = get_lib_targets(&package);
 
     let test_targets = package
         .targets
@@ -331,6 +318,21 @@ pub fn check_dep_target(dk: &DepKindInfo) -> bool {
     platform.matches(&target, &cfgs[..])
 }
 
+fn get_lib_targets(package: &Package) -> Vec<&Target> {
+    package
+        .targets
+        .iter()
+        .filter(|t| {
+            t.kind.contains(&cargo_metadata::TargetKind::Lib)
+                || t.kind.contains(&cargo_metadata::TargetKind::CDyLib)
+                || t.kind.contains(&cargo_metadata::TargetKind::DyLib)
+                || t.kind.contains(&cargo_metadata::TargetKind::RLib)
+                || t.kind.contains(&cargo_metadata::TargetKind::StaticLib)
+                || t.kind.contains(&cargo_metadata::TargetKind::ProcMacro)
+        })
+        .collect()
+}
+
 fn set_deps(
     rust_rule: &mut dyn RustRule,
     node: &Node,
@@ -354,74 +356,58 @@ fn set_deps(
                         get_buck2_root().unwrap_or_exit_ctx("failed to get buck2 root");
                     let manifest_path = PathBuf::from(&dep_package.manifest_path);
                     let manifest_dir = manifest_path.parent().unwrap();
-                    let relative = manifest_dir.strip_prefix(&buck2_root).ok();
+                    let relative_path = manifest_dir
+                        .strip_prefix(&buck2_root)
+                        .unwrap_or_exit_ctx(
+                            "Current directory is not inside the Buck2 project root",
+                        )
+                        .to_string_lossy();
 
-                    if relative.is_none() {
-                        eprintln!("error: Current directory is not inside the Buck2 project root.");
-                        return;
+                    let dep_bin_targets = dep_package
+                        .targets
+                        .iter()
+                        .filter(|t| t.kind.contains(&cargo_metadata::TargetKind::Bin))
+                        .collect::<Vec<_>>();
+
+                    let dep_lib_targets = get_lib_targets(dep_package);
+
+                    if dep_lib_targets.len() != 1 {
+                        buckal_error!(
+                            "Expected exactly one library target for dependency {}, but found {}",
+                            dep_package.name,
+                            dep_lib_targets.len()
+                        );
+                        std::process::exit(1);
                     }
-                    let mut relative_path = relative.unwrap().to_string_lossy().into_owned();
 
-                    if !relative_path.is_empty() {
-                        relative_path += "/";
-                    }
+                    let buckal_name = if dep_bin_targets
+                        .iter()
+                        .any(|b| b.name == dep_lib_targets[0].name)
+                    {
+                        format!("lib{}", dep_lib_targets[0].name)
+                    } else {
+                        dep_lib_targets[0].name.to_owned()
+                    };
 
-                    let target = format!("//{relative_path}...");
+                    let target_label = format!("{relative_path}:{buckal_name}");
 
-                    match Buck2Command::targets().arg(target).arg("--json").output() {
-                        Ok(output) if output.status.success() => {
-                            let json_str = String::from_utf8_lossy(&output.stdout);
-                            let targets: Vec<Value> = serde_json::from_str(&json_str).unwrap();
-                            let target_item = targets
-                                .iter()
-                                .find(|t| {
-                                    t.get("buck.type")
-                                        .and_then(|k| k.as_str())
-                                        .is_some_and(|k| k.ends_with("rust_library"))
-                                })
-                                .expect("Failed to find rust library rule in BUCK file");
-                            let buck_package = target_item
-                                .get("buck.package")
-                                .and_then(|n| n.as_str())
-                                .expect("Failed to get target name")
-                                .strip_prefix("root")
-                                .unwrap();
-                            let buck_name = target_item
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .expect("Failed to get target name");
+                    let rewritten_target = rewrite_target_if_needed(
+                        &target_label,
+                        buck2_root.as_std_path(),
+                        ctx.repo_config.align_cells,
+                    )
+                    .unwrap_or_else(|e| {
+                        buckal_warn!("Failed to rewrite target label '{}': {}", target_label, e);
+                        target_label
+                    });
 
-                            let target_label = format!("{buck_package}:{buck_name}");
-
-                            let rewritten_target = rewrite_target_if_needed(
-                                &target_label,
-                                buck2_root.as_std_path(),
-                                ctx.repo_config.align_cells,
-                            )
-                            .unwrap_or_else(|e| {
-                                buckal_warn!(
-                                    "Failed to rewrite target label '{}': {}",
-                                    target_label,
-                                    e
-                                );
-                                target_label
-                            });
-
-                            if dep.name != dep_package_name.replace("-", "_") {
-                                // renamed dependency
-                                rust_rule
-                                    .named_deps_mut()
-                                    .insert(dep.name.clone(), rewritten_target);
-                            } else {
-                                rust_rule.deps_mut().insert(rewritten_target);
-                            }
-                        }
-                        Ok(output) => {
-                            panic!("{}", String::from_utf8_lossy(&output.stderr));
-                        }
-                        Err(e) => {
-                            panic!("Failed to execute buck2 command: {}", e);
-                        }
+                    if dep.name != dep_package_name.replace("-", "_") {
+                        // renamed dependency
+                        rust_rule
+                            .named_deps_mut()
+                            .insert(dep.name.clone(), rewritten_target);
+                    } else {
+                        rust_rule.deps_mut().insert(rewritten_target);
                     }
                 } else {
                     // third-party dependency
@@ -911,11 +897,6 @@ pub fn flush_root(ctx: &BuckalContext) {
             "third-party alias rules (inherit_workspace_deps=true)"
         );
         generate_third_party_aliases(ctx);
-    } else {
-        buckal_log!(
-            "Skipping",
-            "third-party alias generation (inherit_workspace_deps=false)"
-        );
     }
 
     let cwd = std::env::current_dir().expect("Failed to get current directory");
