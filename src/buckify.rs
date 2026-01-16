@@ -26,7 +26,7 @@ use crate::{
     context::BuckalContext,
     platform::lookup_platforms,
     utils::{
-        UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_dir,
+        UnwrapOrExit, get_buck2_root, get_cfgs, get_current_buck_path, get_target, get_vendor_dir,
         rewrite_target_if_needed,
     },
 };
@@ -395,19 +395,8 @@ fn set_deps(
                             let target_label = format!("{buck_package}:{buck_name}");
 
                             // Obtain the current BUCK file path
-                            // For root directory, the BUCK file is located in the project root directory
-                            // For third-party packages, the BUCK file is located in the vendor directory
-                            let current_buck_path = if package.source.is_none() {
-                                // The BUCK file is located in the project's root directory
-                                get_buck2_root()
-                                    .unwrap_or_exit_ctx("failed to get buck2 root")
-                                    .join("BUCK")
-                            } else {
-                                // The BUCK file is located in the vendor directory
-                                get_vendor_dir(&package.name, &package.version.to_string())
-                                    .unwrap_or_exit_ctx("failed to get vendor directory")
-                                    .join("BUCK")
-                            };
+                            let current_buck_path = get_current_buck_path(package)
+                                .unwrap_or_exit_ctx("failed to get current BUCK file path");
 
                             let rewritten_target = rewrite_target_if_needed(
                                 &target_label,
@@ -458,19 +447,8 @@ fn set_deps(
                     };
 
                     // Obtain the current BUCK file path
-                    // For root directory, the BUCK file is located in the project root directory
-                    // For third-party packages, the BUCK file is located in the vendor directory
-                    let current_buck_path = if package.source.is_none() {
-                        // the BUCK file is located in the project root directory
-                        get_buck2_root()
-                            .unwrap_or_exit_ctx("failed to get buck2 root")
-                            .join("BUCK")
-                    } else {
-                        // the BUCK file is located in the vendor directory
-                        get_vendor_dir(&package.name, &package.version.to_string())
-                            .unwrap_or_exit_ctx("failed to get vendor directory")
-                            .join("BUCK")
-                    };
+                    let current_buck_path = get_current_buck_path(package)
+                        .unwrap_or_exit_ctx("failed to get current BUCK file path");
 
                     let rewritten_target = rewrite_target_if_needed(
                         &dep_target,
@@ -738,19 +716,8 @@ fn emit_buildscript_run(
                     dep_package.name, dep_package.version, dep_package.name
                 );
                 // Obtain the current BUCK file path
-                // For root directory, the BUCK file is located in the project root directory
-                // For third-party packages, the BUCK file is located in the vendor directory
-                let current_buck_path = if package.source.is_none() {
-                    // the BUCK file is located in the project root directory
-                    get_buck2_root()
-                        .unwrap_or_exit_ctx("failed to get buck2 root")
-                        .join("BUCK")
-                } else {
-                    // the BUCK file is located in the vendor directory
-                    get_vendor_dir(&package.name, &package.version.to_string())
-                        .unwrap_or_exit_ctx("failed to get vendor directory")
-                        .join("BUCK")
-                };
+                let current_buck_path = get_current_buck_path(package)
+                    .unwrap_or_exit_ctx("failed to get current BUCK file path");
 
                 let rewritten_target = rewrite_target_if_needed(
                     &target_label,

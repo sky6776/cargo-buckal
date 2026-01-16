@@ -481,7 +481,7 @@ pub fn get_cell_mapping_via_buck2(buck2_root: &Path) -> Result<HashMap<String, S
     let result = get_cell_mapping_via_buck2_uncached(buck2_root)?;
 
     // Store in cache
-    let mut cache_lock = cache.lock().unwrap();
+    let mut cache_lock = cache.lock().expect("Cell mapping cache mutex poisoned");
     cache_lock.insert(buck2_root_str, result.clone());
 
     Ok(result)
@@ -638,15 +638,11 @@ pub fn rewrite_target_simple(
     }
 
     let result = if let Some((key, value)) = best_match {
-        // Replace the value with key
         let remaining_path = &target[value.len()..];
-        if remaining_path.starts_with(':') {
-            format!("{}//{}", key, remaining_path)
-        } else {
-            format!("{}/{}", key, remaining_path)
-        }
+        // ALWAYS use // as separator between cell and path
+        let remaining = remaining_path.trim_start_matches('/');
+        format!("{}//{}", key, remaining)
     } else {
-        // No match found, return original target without @ prefix
         target.to_string()
     };
 
@@ -655,6 +651,19 @@ pub fn rewrite_target_simple(
         format!("@{}", result)
     } else {
         result
+    }
+}
+
+/// Get the current BUCK file path based on package source
+/// For first-party packages (no source), returns BUCK file in project root
+/// For third-party packages, returns BUCK file in vendor directory
+pub fn get_current_buck_path(package: &cargo_metadata::Package) -> io::Result<Utf8PathBuf> {
+    if package.source.is_none() {
+        // The BUCK file is located in the project's root directory
+        Ok(get_buck2_root()?.join("BUCK"))
+    } else {
+        // The BUCK file is located in the vendor directory
+        Ok(get_vendor_dir(&package.name, &package.version.to_string())?.join("BUCK"))
     }
 }
 
