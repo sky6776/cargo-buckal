@@ -632,7 +632,8 @@ pub fn rewrite_target_simple(target: &str, cell_mapping: &HashMap<String, String
         let remaining = remaining_path.trim_start_matches('/');
         format!("{}//{}", key, remaining)
     } else {
-        target.to_string()
+        // 当 best_match 为 None 时，在 target 前面加上 //
+        format!("//{}", target)
     }
 }
 
