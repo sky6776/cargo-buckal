@@ -602,24 +602,13 @@ fn compute_cell_aliases(cell_mapping: &HashMap<String, String>) -> HashMap<Strin
 
 /// Simplified version: Rewrite target label using cell mapping
 /// This version replaces target paths with cell aliases
-pub fn rewrite_target_simple(
-    target: &str,
-    cell_mapping: &HashMap<String, String>,
-    current_file_path: &Path,
-    buck2_root: &Path,
-) -> String {
+pub fn rewrite_target_simple(target: &str, cell_mapping: &HashMap<String, String>) -> String {
     if target.is_empty() {
         return target.to_string();
     }
 
     // Compute cell aliases from cell mapping
     let cell_aliases = compute_cell_aliases(cell_mapping);
-
-    // Check if we're in root directory (no @ prefix needed for root BUCK files)
-    let is_in_root = current_file_path
-        .parent()
-        .map(|p| p == buck2_root)
-        .unwrap_or(false);
 
     // Find the longest matching value in cell_aliases
     let mut best_match: Option<(&String, &String)> = None;
@@ -637,33 +626,13 @@ pub fn rewrite_target_simple(
         }
     }
 
-    let result = if let Some((key, value)) = best_match {
+    if let Some((key, value)) = best_match {
         let remaining_path = &target[value.len()..];
         // ALWAYS use // as separator between cell and path
         let remaining = remaining_path.trim_start_matches('/');
         format!("{}//{}", key, remaining)
     } else {
         target.to_string()
-    };
-
-    // Add @ prefix if not in root or if original had @ prefix
-    if !is_in_root && !result.starts_with('@') {
-        format!("@{}", result)
-    } else {
-        result
-    }
-}
-
-/// Get the current BUCK file path based on package source
-/// For first-party packages (no source), returns BUCK file in project root
-/// For third-party packages, returns BUCK file in vendor directory
-pub fn get_current_buck_path(package: &cargo_metadata::Package) -> io::Result<Utf8PathBuf> {
-    if package.source.is_none() {
-        // The BUCK file is located in the project's root directory
-        Ok(get_buck2_root()?.join("BUCK"))
-    } else {
-        // The BUCK file is located in the vendor directory
-        Ok(get_vendor_dir(&package.name, &package.version.to_string())?.join("BUCK"))
     }
 }
 
@@ -672,7 +641,6 @@ pub fn rewrite_target_if_needed(
     target: &str,
     buck2_root: &Path,
     align_cells: bool,
-    current_file_path: &Path,
 ) -> Result<String> {
     if !align_cells {
         return Ok(target.to_string());
@@ -681,10 +649,5 @@ pub fn rewrite_target_if_needed(
     let cell_mapping = get_cell_mapping_via_buck2(buck2_root)?;
 
     // Use simplified version that handles cell alias normalization and path-based cell detection
-    Ok(rewrite_target_simple(
-        target,
-        &cell_mapping,
-        current_file_path,
-        buck2_root,
-    ))
+    Ok(rewrite_target_simple(target, &cell_mapping))
 }

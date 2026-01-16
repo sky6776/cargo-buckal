@@ -26,7 +26,7 @@ use crate::{
     context::BuckalContext,
     platform::lookup_platforms,
     utils::{
-        UnwrapOrExit, get_buck2_root, get_cfgs, get_current_buck_path, get_target, get_vendor_dir,
+        UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_dir,
         rewrite_target_if_needed,
     },
 };
@@ -337,7 +337,6 @@ fn set_deps(
     packages_map: &HashMap<PackageId, Package>,
     kind: CargoTargetKind,
     ctx: &BuckalContext,
-    package: &Package,
 ) {
     for dep in &node.deps {
         if let Some(dep_package) = packages_map.get(&dep.pkg) {
@@ -394,15 +393,10 @@ fn set_deps(
 
                             let target_label = format!("{buck_package}:{buck_name}");
 
-                            // Obtain the current BUCK file path
-                            let current_buck_path = get_current_buck_path(package)
-                                .unwrap_or_exit_ctx("failed to get current BUCK file path");
-
                             let rewritten_target = rewrite_target_if_needed(
                                 &target_label,
                                 buck2_root.as_std_path(),
                                 ctx.repo_config.align_cells,
-                                current_buck_path.as_std_path(),
                             )
                             .unwrap_or_else(|e| {
                                 buckal_warn!(
@@ -446,17 +440,12 @@ fn set_deps(
                         )
                     };
 
-                    // Obtain the current BUCK file path
-                    let current_buck_path = get_current_buck_path(package)
-                        .unwrap_or_exit_ctx("failed to get current BUCK file path");
-
                     let rewritten_target = rewrite_target_if_needed(
                         &dep_target,
                         get_buck2_root()
                             .unwrap_or_exit_ctx("failed to get buck2 root")
                             .as_std_path(),
                         ctx.repo_config.align_cells,
-                        current_buck_path.as_std_path(),
                     )
                     .unwrap_or_else(|e| {
                         buckal_warn!("Failed to rewrite target label '{}': {}", dep_target, e);
@@ -529,7 +518,6 @@ fn emit_rust_library(
         packages_map,
         CargoTargetKind::Lib,
         ctx,
-        package,
     );
     rust_library
 }
@@ -575,7 +563,6 @@ fn emit_rust_binary(
         packages_map,
         CargoTargetKind::Bin,
         ctx,
-        package,
     );
     rust_binary
 }
@@ -621,7 +608,6 @@ fn emit_rust_test(
         packages_map,
         CargoTargetKind::Test,
         ctx,
-        package,
     );
     rust_test
 }
@@ -666,7 +652,6 @@ fn emit_buildscript_build(
         packages_map,
         CargoTargetKind::CustomBuild,
         ctx,
-        package,
     );
 
     buildscript_build
@@ -715,9 +700,6 @@ fn emit_buildscript_run(
                     "//{RUST_CRATES_ROOT}/{}/{}:{}-{build_name_dep}-run[metadata]",
                     dep_package.name, dep_package.version, dep_package.name
                 );
-                // Obtain the current BUCK file path
-                let current_buck_path = get_current_buck_path(package)
-                    .unwrap_or_exit_ctx("failed to get current BUCK file path");
 
                 let rewritten_target = rewrite_target_if_needed(
                     &target_label,
@@ -725,7 +707,6 @@ fn emit_buildscript_run(
                         .unwrap_or_exit_ctx("failed to get buck2 root")
                         .as_std_path(),
                     ctx.repo_config.align_cells,
-                    current_buck_path.as_std_path(),
                 )
                 .unwrap_or_else(|e| {
                     buckal_warn!("Failed to rewrite target label '{}': {}", target_label, e);
@@ -992,16 +973,12 @@ pub fn generate_third_party_aliases(ctx: &BuckalContext) {
             "//third-party/rust/crates/{}/{}:{}",
             crate_name, latest.version, crate_name
         );
-        let rewritten_actual = rewrite_target_if_needed(
-            &actual,
-            root.as_std_path(),
-            ctx.repo_config.align_cells,
-            buck_file.as_std_path(), // third-party/rust/BUCK file path
-        )
-        .unwrap_or_else(|e| {
-            buckal_warn!("Failed to rewrite target label '{}': {}", actual, e);
-            actual.clone()
-        });
+        let rewritten_actual =
+            rewrite_target_if_needed(&actual, root.as_std_path(), ctx.repo_config.align_cells)
+                .unwrap_or_else(|e| {
+                    buckal_warn!("Failed to rewrite target label '{}': {}", actual, e);
+                    actual.clone()
+                });
 
         let rule = Alias {
             name: crate_name.clone(),
