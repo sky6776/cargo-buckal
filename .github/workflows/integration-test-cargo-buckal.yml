@@ -1,0 +1,40 @@
+# cargo-buckal Integration Test - Generate Buck2 files for self and validate builds
+#
+# This workflow uses reusable workflows for generate and test phases.
+# It tests cargo-buckal's ability to generate Buck2 files for its own source.
+
+name: Integration Test cargo-buckal
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        type: boolean
+        description: 'Run with tmate debug (manual only)'
+        required: false
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate_buck2_files:
+    uses: ./.github/workflows/_buck2-generate.yml
+    with:
+      project_name: cargo-buckal
+
+  verify_cross_platform:
+    needs: generate_buck2_files
+    uses: ./.github/workflows/_buck2-verify-cross-platform.yml
+    with:
+      project_name: cargo-buckal
+
+  buck2_build_test:
+    needs: generate_buck2_files
+    uses: ./.github/workflows/_buck2-build-test.yml
+    with:
+      project_name: cargo-buckal
+      build_target: //...
+      run_tests: false
+      debug_enabled: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled || false }}

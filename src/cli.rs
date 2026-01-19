@@ -47,6 +47,9 @@ pub enum BuckalSubCommands {
     /// Remove dependencies from a manifest file
     Remove(crate::commands::remove::RemoveArgs),
 
+    /// Execute the tests of a local package
+    Test(Box<crate::commands::test::TestArgs>),
+
     /// Update dependencies in a manifest file
     Update(crate::commands::update::UpdateArgs),
 
@@ -66,6 +69,7 @@ impl Cli {
                 BuckalSubCommands::Migrate(args) => crate::commands::migrate::execute(args),
                 BuckalSubCommands::New(args) => crate::commands::new::execute(args),
                 BuckalSubCommands::Remove(args) => crate::commands::remove::execute(args),
+                BuckalSubCommands::Test(args) => crate::commands::test::execute(args),
                 BuckalSubCommands::Update(args) => crate::commands::update::execute(args),
                 BuckalSubCommands::Version(args) => crate::commands::version::execute(args),
             },

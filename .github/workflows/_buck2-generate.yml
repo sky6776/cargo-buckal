@@ -1,0 +1,174 @@
+# Reusable workflow for generating Buck2 files
+#
+# This workflow:
+# 1. Sets up the build environment on 3 platforms (linux/macos/windows)
+# 2. Installs cargo-buckal and Buck2
+# 3. Generates Buck2 files for the target project
+# 4. Uploads artifacts for the test phase
+
+name: Generate Buck2 Targets
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        description: 'Project name for artifact naming (e.g., fd, libra, cargo-buckal)'
+        required: true
+        type: string
+      clone_url:
+        description: 'Git URL to clone (leave empty for self-test)'
+        required: false
+        type: string
+        default: ''
+      clone_ref:
+        description: 'Git ref (branch/tag) to clone'
+        required: false
+        type: string
+        default: 'main'
+      project_dir:
+        description: 'Directory name for the project (defaults to project_name)'
+        required: false
+        type: string
+        default: ''
+      nightly_toolchain:
+        description: 'Nightly Rust toolchain version'
+        required: false
+        type: string
+        default: 'nightly-2025-08-01'
+      clean_existing_buck2_and_buckal:
+        description: 'Clean existing Buck2/Buckal files before generating'
+        required: false
+        type: boolean
+        default: false
+      set_ignore_tests_false:
+        description: 'Ensure buckal.toml contains ignore_tests = false before generation'
+        required: false
+        type: boolean
+        default: false
+      apply_patches:
+        description: 'Apply patches from .github/patches/{project_name}/ after generation'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  generate_buck2_files:
+    name: generate (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-24.04
+          - name: macos
+            os: macos-14
+          - name: windows
+            os: windows-2022
+
+    steps:
+      - name: Set cargo target dir
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/cargo-target" >> "$GITHUB_ENV"
+
+      - name: Checkout cargo-buckal
+        uses: actions/checkout@v6
+        with:
+          path: cargo-buckal
+
+      - name: Setup Windows environment
+        uses: ./cargo-buckal/.github/actions/setup-windows
+
+      - name: Clone ${{ inputs.project_name }} ${{ inputs.clone_ref }}
+        if: inputs.clone_url != ''
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "${{ inputs.clone_ref }}" "${{ inputs.clone_url }}" "${{ inputs.project_dir || inputs.project_name }}"
+
+      - name: Setup Rust toolchains
+        uses: ./cargo-buckal/.github/actions/setup-rust-toolchains
+        with:
+          nightly_toolchain: ${{ inputs.nightly_toolchain }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            cargo-buckal -> target
+          cache-all-crates: true
+
+      - name: Install Buck2
+        uses: ./cargo-buckal/.github/actions/install-buck2
+
+      - name: Install cargo-buckal
+        shell: bash
+        run: |
+          cd cargo-buckal
+          cargo install --locked --path .
+
+      # For external projects, clean up existing Buck2/Buckal files and reinitialize
+      - name: Clean up existing Buck2/Buckal files
+        if: inputs.clean_existing_buck2_and_buckal
+        shell: bash
+        run: |
+          cd "${{ inputs.project_dir || inputs.project_name }}"
+          rm -f buckal.snap .buckconfig .buckroot BUCK
+          rm -rf third-party toolchains platforms
+
+      - name: Initialize Buck2
+        shell: bash
+        run: |
+          cd "${{ inputs.project_dir || inputs.project_name }}"
+          buck2 init
+
+      - name: Configure buckal.toml ignore_tests
+        if: inputs.set_ignore_tests_false
+        shell: bash
+        run: |
+          cd "${{ inputs.project_dir || inputs.project_name }}"
+          touch buckal.toml
+          if ! grep -q '^ignore_tests = false$' buckal.toml; then
+            echo 'ignore_tests = false' >> buckal.toml
+          fi
+
+      - name: Generate Buck2 files
+        shell: bash
+        run: |
+          cd "${{ inputs.project_dir || inputs.project_name || 'cargo-buckal' }}"
+          rm -rf toolchains platforms
+          cargo buckal migrate --buck2
+
+      - name: Apply patches
+        if: inputs.apply_patches
+        shell: bash
+        run: |
+          cd "${{ inputs.project_dir || inputs.project_name }}"
+          PATCH_DIR="../cargo-buckal/.github/patches/${{ inputs.project_name }}"
+          if [[ -d "$PATCH_DIR" ]]; then
+            echo "Applying patches from $PATCH_DIR"
+            # Apply .patch files
+            for patch in "$PATCH_DIR"/*.patch; do
+              if [[ -f "$patch" ]]; then
+                echo "Applying patch: $patch"
+                git apply "$patch" || patch -p1 < "$patch"
+              fi
+            done
+            # Run .sh scripts
+            for script in "$PATCH_DIR"/*.sh; do
+              if [[ -f "$script" ]]; then
+                echo "Running script: $script"
+                chmod +x "$script"
+                bash "$script"
+              fi
+            done
+          else
+            echo "No patches directory found at $PATCH_DIR"
+          fi
+
+      - name: Upload generated tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.project_name }}-gen-${{ matrix.name }}
+          path: ${{ inputs.project_dir || inputs.project_name || 'cargo-buckal' }}
+          if-no-files-found: error
+          include-hidden-files: true

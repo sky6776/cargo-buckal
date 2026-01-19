@@ -1,0 +1,147 @@
+# Reusable workflow for testing Buck2 builds across platforms
+#
+# This workflow:
+# 1. Downloads generated artifacts from the generate phase
+# 2. Sets up cross-compilation toolchains
+# 3. Builds and optionally tests with Buck2
+
+name: Build and Test Buck2
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        description: 'Project name for artifact naming (e.g., fd, libra, cargo-buckal)'
+        required: true
+        type: string
+      project_dir:
+        description: 'Directory name for the project (defaults to project_name)'
+        required: false
+        type: string
+        default: ''
+      build_target:
+        description: 'Buck2 build target (e.g., "//:fd" or "//...")'
+        required: false
+        type: string
+        default: '//...'
+      run_tests:
+        description: 'Whether to run buck2 test after build'
+        required: false
+        type: boolean
+        default: true
+      debug_enabled:
+        description: 'Enable tmate debug session'
+        required: false
+        type: boolean
+        default: false
+      nightly_toolchain:
+        description: 'Nightly Rust toolchain version'
+        required: false
+        type: string
+        default: 'nightly-2025-08-01'
+
+jobs:
+  test:
+    name: ${{ matrix.target }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      MSYS_NO_PATHCONV: ${{ matrix.os == 'Windows' && '1' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Since generated Buck2 files are identical across platforms (verified by _buck2-verify-cross-platform.yml),
+          # we only need to test one generated artifact per target platform.
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+
+    steps:
+      - name: Set cargo target dir
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/cargo-target" >> "$GITHUB_ENV"
+
+      # ============================================================
+      # Checkout cargo-buckal for reusable actions
+      # ============================================================
+      - name: Checkout cargo-buckal (for actions)
+        uses: actions/checkout@v6
+        with:
+          path: cargo-buckal
+          sparse-checkout: .github/actions
+
+      # ============================================================
+      # Windows-specific setup
+      # ============================================================
+      - name: Setup Windows environment
+        uses: ./cargo-buckal/.github/actions/setup-windows
+
+      # ============================================================
+      # Download generated tree
+      # ============================================================
+      - name: Download ${{ inputs.project_name }}-gen-linux
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.project_name }}-gen-linux
+          path: ${{ inputs.project_dir || inputs.project_name }}
+
+      # ============================================================
+      # Rust toolchain setup
+      # ============================================================
+      - name: Setup Rust toolchains
+        uses: ./cargo-buckal/.github/actions/setup-rust-toolchains
+        with:
+          nightly_toolchain: ${{ inputs.nightly_toolchain }}
+          targets: ${{ matrix.target }}
+
+      # ============================================================
+      # Caching
+      # ============================================================
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+
+      # ============================================================
+      # Install Buck2
+      # ============================================================
+      - name: Install Buck2
+        uses: ./cargo-buckal/.github/actions/install-buck2
+
+      # ============================================================
+      # Show version information
+      # ============================================================
+      - name: Show version information
+        shell: bash
+        run: |
+          echo "=== Rust ==="
+          rustup -V
+          rustup toolchain list
+          cargo -V
+          rustc -V
+          echo "=== Buck2 ==="
+          buck2 --version || buck2 -V || true
+          echo "=== GCC ==="
+          gcc --version || true
+
+      # ============================================================
+      # Buck2 build
+      # ============================================================
+      - name: Buck2 build
+        shell: bash
+        run: |
+          cd "${{ inputs.project_dir || inputs.project_name }}"
+          buck2 build ${{ inputs.build_target }} --target-platforms //platforms:${{ matrix.target }}
+
+      # ============================================================
+      # Buck2 test
+      # ============================================================
+      - name: Buck2 test
+        if: inputs.run_tests
+        shell: bash
+        run: |
+          cd "${{ inputs.project_dir || inputs.project_name }}"
+          buck2 test //... --target-platforms //platforms:${{ matrix.target }}
