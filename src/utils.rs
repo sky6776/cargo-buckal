@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::{io, process::Command, str::FromStr};
 
@@ -475,42 +474,34 @@ impl<T, E: std::fmt::Display> UnwrapOrExit<T> for Result<T, E> {
     }
 }
 
-// Cache for cell mapping results
-static CELL_MAPPING_CACHE: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> =
+// Cache for cell aliases results (keyed by buck2 root path)
+static CELL_ALIASES_CACHE: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> =
     OnceLock::new();
 
-/// Get cell mapping using buck2 audit cell command with caching
+/// Get cell mapping using buck2 audit cell command (uncached)
 /// Returns a HashMap where key is cell name or alias, value is absolute path
-pub fn get_cell_mapping_via_buck2(buck2_root: &Path) -> Result<HashMap<String, String>> {
-    // Get cache or initialize it
-    let cache = CELL_MAPPING_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+pub fn get_cell_mapping_via_buck2(
+    buck2_root: Option<Utf8PathBuf>,
+) -> Result<HashMap<String, String>> {
+    let buck2_root = match buck2_root {
+        Some(root) => root,
+        None => get_buck2_root().context("failed to get buck2 root")?,
+    };
 
-    // Convert buck2_root to string key
-    let buck2_root_str = buck2_root.to_string_lossy().to_string();
-
-    // Check cache first
-    {
-        let cache_lock = cache.lock().unwrap();
-        if let Some(cached_result) = cache_lock.get(&buck2_root_str) {
-            return Ok(cached_result.clone());
-        }
-    }
-
-    // Not in cache, execute command
-    let result = get_cell_mapping_via_buck2_uncached(buck2_root)?;
-
-    // Store in cache
-    let mut cache_lock = cache.lock().expect("Cell mapping cache mutex poisoned");
-    cache_lock.insert(buck2_root_str, result.clone());
-
-    Ok(result)
-}
-
-/// Internal function that actually executes the buck2 command (uncached)
-fn get_cell_mapping_via_buck2_uncached(buck2_root: &Path) -> Result<HashMap<String, String>> {
     // Change to buck2 root directory to run the command
-    let current_dir = std::env::current_dir()?;
-    std::env::set_current_dir(buck2_root)?;
+    let current_dir = std::env::current_dir().unwrap_or_else(|e| {
+        buckal_error!("Failed to get current directory: {}", e);
+        std::process::exit(1);
+    });
+
+    std::env::set_current_dir(&buck2_root).unwrap_or_else(|e| {
+        buckal_error!(
+            "Failed to change to buck2 root directory '{}': {}",
+            buck2_root.as_str(),
+            e
+        );
+        std::process::exit(1);
+    });
 
     let result = Buck2Command::new()
         .arg("audit")
@@ -520,46 +511,76 @@ fn get_cell_mapping_via_buck2_uncached(buck2_root: &Path) -> Result<HashMap<Stri
         .output();
 
     // Restore original directory
-    std::env::set_current_dir(&current_dir)?;
+    std::env::set_current_dir(&current_dir).unwrap_or_else(|e| {
+        buckal_error!("Failed to restore original directory: {}", e);
+        std::process::exit(1);
+    });
 
     match result {
         Ok(output) if output.status.success() => {
             let json_str = String::from_utf8_lossy(&output.stdout);
-            let cell_mapping: HashMap<String, String> = serde_json::from_str(&json_str)
-                .context("Failed to parse buck2 audit cell --json output")?;
-            Ok(cell_mapping)
+            match serde_json::from_str::<HashMap<String, String>>(&json_str) {
+                Ok(cell_mapping) => Ok(cell_mapping),
+                Err(e) => {
+                    buckal_error!("Failed to parse buck2 audit cell --json output: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            buckal_warn!(
+            buckal_error!(
                 "buck2 audit cell command failed with status: {}\nstderr: {}\nstdout: {}",
                 output.status,
                 stderr,
                 stdout
             );
-            Err(anyhow::anyhow!(
-                "buck2 audit cell command failed with status: {}\nstderr: {}",
-                output.status,
-                stderr
-            ))
+            std::process::exit(1);
         }
         Err(e) => {
-            buckal_warn!("Failed to execute buck2 audit cell command: {}", e);
-            Err(anyhow::anyhow!(
-                "Failed to execute buck2 audit cell command: {}",
-                e
-            ))
+            buckal_error!("Failed to execute buck2 audit cell command: {}", e);
+            std::process::exit(1);
         }
     }
 }
 
-/// Compute cell aliases from cell mapping
+/// Get cell aliases using buck2 audit cell command with caching
+/// Returns a HashMap where key is cell name or alias, value is relative path starting with "//"
+pub fn get_cell_aliases_via_buck2() -> Result<HashMap<String, String>> {
+    // Get cache or initialize it
+    let cache = CELL_ALIASES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let buck2_root = get_buck2_root().context("failed to get buck2 root")?;
+    let buck2_root_str = buck2_root.as_std_path().to_string_lossy().to_string();
+
+    // Check cache first
+    {
+        let cache_lock = cache.lock().unwrap();
+        if let Some(cached_result) = cache_lock.get(&buck2_root_str) {
+            return Ok(cached_result.clone());
+        }
+    }
+
+    // Not in cache, get cell mapping (uncached) and compute aliases
+    let cell_mapping = get_cell_mapping_via_buck2(Some(buck2_root.clone()))?;
+    let result = compute_cell_aliases_uncached(&cell_mapping);
+
+    // Store in cache
+    let mut cache_lock = cache.lock().expect("Cell aliases cache mutex poisoned");
+    cache_lock.insert(buck2_root_str, result.clone());
+
+    Ok(result)
+}
+
+/// Compute cell aliases from cell mapping (uncached version)
 /// Converts absolute paths to relative paths starting with "//"
 /// For example: "L:\\...\\hello_world\\third-party" -> "//third-party"
 /// If there are multiple keys corresponding to the same path,
 /// select the shortest one as the final key and remove the others.
-fn compute_cell_aliases(cell_mapping: &HashMap<String, String>) -> HashMap<String, String> {
+fn compute_cell_aliases_uncached(
+    cell_mapping: &HashMap<String, String>,
+) -> HashMap<String, String> {
     let mut result = HashMap::new();
 
     // First, find the project root directory
@@ -619,15 +640,14 @@ fn compute_cell_aliases(cell_mapping: &HashMap<String, String>) -> HashMap<Strin
     result
 }
 
-/// Simplified version: Rewrite target label using cell mapping
-/// This version replaces target paths with cell aliases
-pub fn rewrite_target_simple(target: &str, cell_mapping: &HashMap<String, String>) -> String {
+/// Rewrite target label using cell aliases
+pub fn rewrite_target_simple(target: &str) -> Result<String> {
     if target.is_empty() {
-        return target.to_string();
+        return Ok(target.to_string());
     }
 
-    // Compute cell aliases from cell mapping
-    let cell_aliases = compute_cell_aliases(cell_mapping);
+    // Get cell aliases from cache
+    let cell_aliases = get_cell_aliases_via_buck2()?;
 
     // Find the longest matching value in cell_aliases
     let mut best_match: Option<(&String, &String)> = None;
@@ -649,25 +669,23 @@ pub fn rewrite_target_simple(target: &str, cell_mapping: &HashMap<String, String
         let remaining_path = &target[value.len()..];
         // ALWAYS use // as separator between cell and path
         let remaining = remaining_path.trim_start_matches('/');
-        format!("{}//{}", key, remaining)
+        Ok(format!("{}//{}", key, remaining))
     } else {
-        // 当 best_match 为 None 时，在 target 前面加上 //
-        format!("//{}", target)
+        // When no cell match is found, ensure target has // prefix
+        if target.starts_with("//") {
+            Ok(target.to_string())
+        } else {
+            let target_trim = target.trim_start_matches('/');
+            Ok(format!("//{}", target_trim))
+        }
     }
 }
 
 /// Reconfigure the target label (if align_cells is enabled)
-pub fn rewrite_target_if_needed(
-    target: &str,
-    buck2_root: &Path,
-    align_cells: bool,
-) -> Result<String> {
+pub fn rewrite_target_if_needed(target: &str, align_cells: bool) -> Result<String> {
     if !align_cells {
         return Ok(target.to_string());
     }
 
-    let cell_mapping = get_cell_mapping_via_buck2(buck2_root)?;
-
-    // Use simplified version that handles cell alias normalization and path-based cell detection
-    Ok(rewrite_target_simple(target, &cell_mapping))
+    rewrite_target_simple(target)
 }
